@@ -1,0 +1,45 @@
+pipeline {
+    agent any
+    stages {
+        stage('Build') {
+            steps {
+                sh 'chmod +x hello.sh'
+                sh './hello.sh'
+                sh './gradlew buildJar'
+                sh 'npm install'
+                sh 'cd src/main/js && node index.js'
+                sh 'mv src/main/js/node-output.txt . || true' // Move if exists
+                sh 'ls -l' // Debug: List workspace root files
+            }
+        }
+        stage('SonarQube Scan') {
+            steps {
+                withSonarQubeEnv('SonarQube_For_Test') {
+                    sh 'sonar-scanner \
+                        -Dsonar.projectKey=codep-test \
+                        -Dsonar.sources=src/main/java,src/main/js \
+                        -Dsonar.host.url=http://sonarqube:9000 \
+                        -Dsonar.login=$SONAR_AUTH_TOKEN'
+                }
+            }
+        }
+        stage('Upload to Nexus') {
+            steps {
+                nexusArtifactUploader(
+                    nexusVersion: 'nexus3',
+                    protocol: 'http',
+                    nexusUrl: 'nexus:8081',
+                    groupId: 'com.codep',
+                    version: '1.0.0',
+                    repository: 'maven-releases',
+                    credentialsId: 'jenkins-nexus',
+                    artifacts: [
+                        [artifactId: 'codep-test', classifier: '', file: 'codep-test.jar', type: 'jar'],
+                        [artifactId: 'codep-test-bash', classifier: '', file: 'output.vtxt', type: 'txt'],
+                        [artifactId: 'codep-test-node', classifier: '', file: 'node-output.txt', type: 'txt']
+                    ]
+                )
+            }
+        }
+    }
+}
