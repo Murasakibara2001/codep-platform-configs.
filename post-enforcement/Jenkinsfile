@@ -1,0 +1,166 @@
+// Jenkinsfile
+pipeline {
+    agent any
+    
+    environment {
+        NEXUS_URL = "http://codep_nexus:8081"
+        SONARQUBE_URL = "http://codep_sonarqube:9000"
+        PROMETHEUS_URL = "http://codep_prometheus:9090"
+        THREAT_DRAGON_URL = "http://codep_threat_dragon:8084"
+        ARTIFACT_NAME = "juice-shop-devsecops"
+        ARTIFACT_VERSION = "${BUILD_NUMBER}"
+        DOCKER_IMAGE = "juice-shop-devsecops:${BUILD_NUMBER}"
+        GPG_KEY_ID = "jenkins@codep.local"
+        SONAR_TOKEN = credentials('sonarqube-token')
+        NEXUS_USER = credentials('nexus-username')
+        NEXUS_PASS = credentials('nexus-password')
+        THREAT_DRAGON_USER = credentials('threat-dragon-username')
+        THREAT_DRAGON_PASS = credentials('threat-dragon-password')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh 'git log -1'
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                sh 'chmod +x hello.sh'
+                sh './hello.sh'
+                sh 'npm install'
+                sh 'npm run build'
+                sh "docker build -t ${DOCKER_IMAGE} ."
+                sh 'ls -l'
+                sh 'mv node-output.txt . || true'
+            }
+        }
+        
+        stage('Threat Modeling') {
+            steps {
+                sh 'bash jenkins/scripts/threat-model.sh'
+            }
+        }
+        
+        stage('SonarQube Scan') {
+            steps {
+                withSonarQubeEnv('SonarQube_For_Test') {
+                    sh 'bash jenkins/scripts/sonarqube-scan.sh'
+                }
+                sh '''
+                    curl -u ${SONAR_TOKEN}: -X GET "${SONARQUBE_URL}/api/qualitygates/project_status?projectKey=juice-shop-devsecops" > qualitygate.json
+                    if grep -q \'"projectStatus":{"status":"OK"\' qualitygate.json; then
+                        echo "Quality gate passed"
+                    else
+                        echo "Quality gate failed"
+                        exit 1
+                    fi
+                '''
+            }
+        }
+        
+        stage('Security Scanning') {
+            parallel {
+                stage('Trivy Scan') {
+                    steps {
+                        sh 'bash jenkins/scripts/trivy-scan.sh'
+                    }
+                }
+                
+                stage('Dependency Check') {
+                    steps {
+                        sh 'bash jenkins/scripts/dependency-check.sh'
+                        sh '''
+                            if grep -q "One or more dependencies were identified with known vulnerabilities" reports/dependency-check/dependency-check-report.xml; then
+                                echo "Vulnerabilities found in dependencies"
+                                exit 1
+                            else
+                                echo "No vulnerabilities found in dependencies"
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Policy Enforcement') {
+            steps {
+                sh 'mkdir -p reports/opa'
+                sh 'echo \'{"trivy": {"critical": 2, "high": 5}, "sonarqube": {"bugs": 10, "vulnerabilities": 5}, "dependency_check": {"critical": 1, "high": 3}}\' > reports/opa/input.json'
+                sh 'opa eval --format pretty --data opa/policy.rego --input reports/opa/input.json "data.juiceshop.policy.allow" > reports/opa/result.txt'
+                sh '''
+                    if grep -q "true" reports/opa/result.txt; then
+                        echo "Policy check passed"
+                    else
+                        echo "Policy check failed"
+                        exit 1
+                    fi
+                '''
+            }
+        }
+        
+        stage('Sign and Publish') {
+            steps {
+                sh 'mkdir -p artifacts'
+                sh 'tar -czf artifacts/${ARTIFACT_NAME}-${ARTIFACT_VERSION}.tar.gz --exclude=node_modules --exclude=.git --exclude=.git-secret .'
+                sh 'cp -r reports artifacts/'
+                sh 'bash jenkins/scripts/sign-artifact.sh'
+                nexusArtifactUploader(
+                    nexusVersion: 'nexus3',
+                    protocol: 'http',
+                    nexusUrl: "${NEXUS_URL}",
+                    groupId: 'com.codep',
+                    version: "${ARTIFACT_VERSION}",
+                    repository: 'maven-releases',
+                    credentialsId: 'jenkins-nexus',
+                    artifacts: [
+                        [artifactId: 'juice-shop-devsecops', classifier: '', file: "artifacts/${ARTIFACT_NAME}-${ARTIFACT_VERSION}.tar.gz", type: 'tar.gz'],
+                        [artifactId: 'juice-shop-sbom-app', classifier: '', file: 'reports/dependency-check/sbom-app.json', type: 'json'],
+                        [artifactId: 'juice-shop-sbom-container', classifier: '', file: 'reports/trivy/sbom-container.json', type: 'json'],
+                        [artifactId: 'juice-shop-threat-model', classifier: '', file: 'docs/threat-model/juice-shop-threats.json', type: 'json']
+                    ]
+                )
+                sh 'echo "Pushing Docker image to Nexus registry..."'
+            }
+        }
+        
+        stage('Export Metrics') {
+            steps {
+                sh 'echo "Exporting metrics to Prometheus..."'
+                sh '''
+                    cat > metrics.txt << EOF
+                    # HELP build_duration_seconds Duration of the build in seconds
+                    # TYPE build_duration_seconds gauge
+                    build_duration_seconds{job="jenkins",pipeline="juice-shop-devsecops"} ${SECONDS}
+                    # HELP vulnerabilities_count Number of vulnerabilities found
+                    # TYPE vulnerabilities_count gauge
+                    vulnerabilities_count{job="jenkins",pipeline="juice-shop-devsecops",severity="critical"} 2
+                    vulnerabilities_count{job="jenkins",pipeline="juice-shop-devsecops",severity="high"} 5
+                    vulnerabilities_count{job="jenkins",pipeline="juice-shop-devsecops",severity="medium"} 10
+                    vulnerabilities_count{job="jenkins",pipeline="juice-shop-devsecops",severity="low"} 15
+                    EOF
+                '''
+                sh "curl -X POST --data-binary @metrics.txt ${PROMETHEUS_URL}/metrics/job/jenkins"
+            }
+        }
+    }
+    
+    post {
+        always {
+            archiveArtifacts artifacts: 'artifacts/**', fingerprint: true
+            archiveArtifacts artifacts: 'reports/**', fingerprint: true
+            archiveArtifacts artifacts: 'docs/threat-model/**', fingerprint: true
+            sh 'docker rmi ${DOCKER_IMAGE} || true'
+        }
+        
+        success {
+            echo 'Pipeline completed successfully!'
+        }
+        
+        failure {
+            echo 'Pipeline failed!'
+        }
+    }
+}
