@@ -1,0 +1,283 @@
+version: '3.8'
+
+services:
+  jenkins:
+    build:
+      context: .
+      dockerfile: codepDockerfile.jenkins
+    container_name: codep_jenkins
+    user: root
+    environment:
+      - CASC_JENKINS_CONFIG=/var/jenkins_home/casc_configs
+      - JENKINS_OPTS=--httpPort=8080
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    ports:
+      - "8080:8080"
+      - "50000:50000"
+    volumes:
+      - codep_jenkins_data:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - codep_network
+    restart: unless-stopped
+    mem_limit: 4g
+    cpus: "2"
+  nexus:
+    image: sonatype/nexus3:3.80.0
+    container_name: codep_nexus
+    ports:
+      - "8081:8081"
+      - "8181:8181"  # Docker registry port (adjust if different)
+    volumes:
+      - codep_nexus_data:/nexus-data
+    environment:
+      - INSTALL4J_ADD_VM_PARAMS=-Xms512m -Xmx1g -XX:MaxDirectMemorySize=1g
+    networks:
+      - codep_network
+    restart: unless-stopped
+  gitlab:
+    image: gitlab/gitlab-ee:16.6.2-ee.0
+    container_name: codep_gitlab
+    hostname: gitlab
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://10.10.10.23:11180'
+        nginx['listen_port'] = 80
+        gitlab_rails['gitlab_shell_ssh_port'] = 10022
+        postgresql['enable'] = false
+        gitlab_rails['db_adapter'] = 'postgresql'
+        gitlab_rails['db_host'] = 'codep_gitlab_db'
+        gitlab_rails['db_port'] = 5432
+        gitlab_rails['db_username'] = 'gitlab'
+        gitlab_rails['db_password'] = 'gitlab_password'
+        gitlab_rails['db_database'] = 'gitlabhq_production'
+        redis['enable'] = false
+        gitlab_rails['redis_host'] = 'codep_redis'
+        gitlab_rails['redis_port'] = 6379
+    ports:
+      - "11180:80"
+      - "10022:22"
+    volumes:
+      - codep_gitlab_config:/etc/gitlab
+      - codep_gitlab_logs:/var/log/gitlab
+      - codep_gitlab_data:/var/opt/gitlab
+    networks:
+      - codep_network
+    depends_on:
+      - codep_gitlab_db
+      - codep_redis
+    restart: unless-stopped
+  gitlab-runner:
+    image: gitlab/gitlab-runner:latest
+    container_name: gitlab-runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./gitlab-runner/config:/etc/gitlab-runner
+    networks:
+      - codep_network
+  codep_gitlab_db:
+    image: postgres:16.1
+    container_name: codep_gitlab_db
+    environment:
+      POSTGRES_USER: gitlab
+      POSTGRES_PASSWORD: gitlab_password
+      POSTGRES_DB: gitlabhq_production
+    volumes:
+      - codep_gitlab_postgres:/var/lib/postgresql/data
+    networks:
+      - codep_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gitlab"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+  codep_redis:
+    image: redis:7.0.12
+    container_name: codep_redis
+    volumes:
+      - codep_redis_data:/data
+    networks:
+      - codep_network
+    restart: unless-stopped
+  sonarqube:
+    image: sonarqube:10.3.0-community
+    container_name: codep_sonarqube
+    depends_on:
+      - codep_sonarqube_db
+    environment:
+      - SONAR_JDBC_URL=jdbc:postgresql://codep_sonarqube_db:5432/sonar
+      - SONAR_JDBC_USERNAME=sonar
+      - SONAR_JDBC_PASSWORD=sonar
+      - SONAR_SEARCH_JAVAADDITIONALOPTS=-Dnode.store.allow_mmap=false
+    ports:
+      - "9000:9000"
+    volumes:
+      - codep_sonarqube_conf:/opt/sonarqube/conf
+      - codep_sonarqube_data:/opt/sonarqube/data
+      - codep_sonarqube_extensions:/opt/sonarqube/extensions
+    networks:
+      - codep_network
+    restart: unless-stopped
+  codep_sonarqube_db:
+    image: postgres:13.12
+    container_name: codep_sonarqube_db
+    environment:
+      - POSTGRES_USER=sonar
+      - POSTGRES_PASSWORD=sonar
+      - POSTGRES_DB=sonar
+    volumes:
+      - codep_sonarqube_postgres:/var/lib/postgresql/data
+    networks:
+      - codep_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonar"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.4
+    container_name: codep_keycloak
+    environment:
+      - KEYCLOAK_ADMIN=admin
+      - KEYCLOAK_ADMIN_PASSWORD=admin_password
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://codep_keycloak_db:5432/keycloak
+      - KC_DB_USERNAME=keycloak
+      - KC_DB_PASSWORD=keycloak_password
+    ports:
+      - "8082:8080"
+    volumes:
+      - codep_keycloak_data:/opt/keycloak/data
+    networks:
+      - codep_network
+    depends_on:
+      - codep_keycloak_db
+    command: ["start-dev"]
+    restart: unless-stopped
+  codep_keycloak_db:
+    image: postgres:16.1
+    container_name: codep_keycloak_db
+    environment:
+      - POSTGRES_USER=keycloak
+      - POSTGRES_PASSWORD=keycloak_password
+      - POSTGRES_DB=keycloak
+    volumes:
+      - codep_keycloak_postgres:/var/lib/postgresql/data
+    networks:
+      - codep_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+  openldap:
+    image: bitnami/openldap:latest
+    container_name: openldap
+    ports:
+      - "389:389"
+      - "636:636"
+    environment:
+      - LDAP_ORGANISATION="codep"
+      - LDAP_DOMAIN="codep.local"
+      - LDAP_ADMIN_USERNAME="admin"
+      - LDAP_ADMIN_PASSWORD="admin_password"
+      - LDAP_CONFIG_PASSWORD=config_password
+      - LDAP_BASE_DN="dc=codep,dc=local"
+      - LDAP_READONLY_USER=true
+      - LDAP_READONLY_USER_USERNAME=readonly
+      - LDAP_READONLY_USER_PASSWORD=readonly_password
+    networks:
+      - codep_network
+    volumes:
+      - codep_openldap_data:/var/lib/ldap
+      - codep_openldap_config:/etc/ldap/slapd.d
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: "0.5"
+  phpldapadmin:
+    image: osixia/phpldapadmin:latest
+    container_name: phpldapadmin
+    ports:
+      - "8083:80"
+      - "10443:443"
+    environment:
+      - PHPLDAPADMIN_LDAP_HOSTS=openldap
+      - PHPLDAPADMIN_HTTPS=false
+    depends_on:
+      - openldap
+    networks:
+      - codep_network
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: "0.5"
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: codep_prometheus
+    volumes:
+      - codep_prometheus_data:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    networks:
+      - codep_network
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: "0.5"
+  grafana:
+    image: grafana/grafana:latest
+    container_name: codep_grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - codep_grafana_data:/var/lib/grafana
+    networks:
+      - codep_network
+    depends_on:
+      - prometheus
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin_password
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: "0.5"
+  threat-dragon:
+    image: owasp/threat-dragon:v2.4.1
+    container_name: codep_threat_dragon
+    ports:
+      - "8084:3000"
+    volumes:
+      - codep_threat_dragon_data:/home/node/app/data
+      - ./threat-dragon-config/.env:/app/.env
+    networks:
+      - codep_network
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: "0.5"
+networks:
+  codep_network:
+    driver: bridge
+    name: codep_network
+volumes:
+  codep_jenkins_data:
+  codep_nexus_data:
+  codep_gitlab_config:
+  codep_gitlab_logs:
+  codep_gitlab_data:
+  codep_gitlab_postgres:
+  codep_redis_data:
+  codep_sonarqube_conf:
+  codep_sonarqube_data:
+  codep_sonarqube_extensions:
+  codep_sonarqube_postgres:
+  codep_keycloak_data:
+  codep_keycloak_postgres:
+  codep_openldap_data:
+  codep_openldap_config:
+  codep_prometheus_data:
+  codep_grafana_data:
+  codep_threat_dragon_data:
