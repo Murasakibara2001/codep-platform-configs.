@@ -1,0 +1,35 @@
+# Stage 1: Download and prepare dependencies
+FROM debian:bullseye-slim AS builder
+
+# Install base dependencies
+RUN apt-get update && apt-get install -y \
+    wget \
+    unzip \
+    curl \
+    gnupg \
+    openjdk-17-jdk \
+    xz-utils \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Download Node.js
+RUN wget --tries=3 -O /tmp/node-v18.19.0-linux-x64.tar.xz https://nodejs.org/dist/v18.19.0/node-v18.19.0-linux-x64.tar.xz \
+    && ls -lh /tmp/node-v18.19.0-linux-x64.tar.xz  # Debug: Verify file exists
+
+# Extract Node.js
+RUN tar -xJf /tmp/node-v18.19.0-linux-x64.tar.xz -C /opt/ \
+    && mv /opt/node-v18.19.0-linux-x64 /opt/node
+
+# Set up Node.js symlinks
+RUN ln -s /opt/node/bin/node /usr/local/bin/node \
+    && ln -s /opt/node/bin/npm /usr/local/bin/npm \
+    && node --version  # Debug: Verify Node.js version
+
+# Clean up
+RUN rm -rf /tmp/node-v18.19.0-linux-x64.tar.xz
+
+# Download SonarScanner
+RUN wget --tries=3 -P /tmp https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip \
+    && unzip /tmp/sonar-scanner-cli-5.0.1.3006-linux.zip -d /opt/ \
+    && mv /opt/sonar-scanner-5.0.1.3006-linux /opt/sonar-scanner \
+    && chmod +x /opt/sonar-scanner/bin/sonar-scanner \
+    && rm -f /tmp/sonar-scanner-cli-5.0.1.3006-linux.zip
