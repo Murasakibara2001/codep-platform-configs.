@@ -1,0 +1,82 @@
+# Stage 1: Download and prepare dependencies
+FROM debian:bullseye-slim AS builder
+
+# Install base dependencies
+RUN apt-get update && apt-get install -y \
+    wget \
+    unzip \
+    curl \
+    gnupg \
+    openjdk-17-jdk \
+    && apt-get clean && rm -rf /var/lib/apt/lists
+
+# Install Node.js
+RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
+    && apt-get install -y nodejs \
+    && node --version
+
+# Install SonarScanner
+RUN wget -O /tmp/sonar-scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip \
+    && unzip /tmp/sonar-scanner.zip -d /opt/ \
+    && mv /opt/sonar-scanner-5.0.1.3006-linux /opt/sonar-scanner \
+    && chmod +x /opt/sonar-scanner/bin/sonar-scanner \
+    && rm -f /tmp/sonar-scanner.zip
+
+# Install OWASP Dependency-Check
+RUN Wget -O /tmp/dependency-check.zip https://github.com/jeremylong/DependencyCheck/releases/download/v9.2.0/dependency-check-9.2.0-release.zip \
+    && unzip /tmp/dependency-check.zip -d /opt/ \
+    && chmod +x /opt/dependency-check/bin/dependency-check.sh \
+    && rm -f /tmp/dependency-check.zip
+
+# Install OPA
+RUN wget -O /usr/local/bin/opa https://openpolicyagent.org/downloads/v0.66.0/opa_linux_amd64_static \
+    && chmod +x /usr/local/bin/opa
+
+# Install Trivy
+RUN curl -fsSL https://github.com/aquasecurity/trivy/releases/download/v0.55.0/trivy_0.55.0_Linux-64bit.tar.gz | tar -xz -C /usr/local/bin/ trivy \
+    && chmod +x /usr/local/bin/trivy
+
+# Stage 2: Final Jenkins image
+FROM jenkins/jenkins:lts
+
+USER root
+
+# Copy dependencies from builder stage
+COPY --from=builder /opt/sonar-scanner /opt/sonar-scanner
+COPY --from=builder /opt/dependency-check /opt/dependency-check
+COPY --from=builder /usr/local/bin/opa /usr/local/bin/opa
+COPY --from=builder /usr/local/bin/trivy /usr/local/bin/trivy
+COPY --from=builder /usr/bin/node /usr/local/bin/node
+COPY --from=builder /usr/bin/npm /usr/local/bin/npm
+
+# Install Docker CLI
+RUN apt-get update && apt-get install -y \
+    apt-transport-https \
+    ca-certificates \
+    curl \
+    gnupg \
+    lsb-release \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add - \
+    && echo "deb [arch=amd64] https://download.docker.com/linux/debian $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y docker-ce-cli \
+    && apt-get clean && rm -rf /var/lib/apt/lists
+
+# Configure PATH for SonarScanner, Dependency-Check, and other tools
+ENV PATH="/opt/sonar-scanner/bin:/opt/dependency-check/bin:/usr/local/bin:${PATH}"
+
+# Generate GPG key (example)
+RUN gpg --batch --generate-key <<EOF
+%no-protection
+Key-Type: RSA
+Key-Length: 2048
+Subkey-Type: RSA
+Subkey-Length: 2048
+Name-Real: Jenkins Automation
+Name-Email: jenkins@codep.local
+Expire-Date: 0
+%commit
+EOF
+RUN gpg --armor --export jenkins@codep.local > /var/jenkins_home/jenkins-gpg-public.key
+
+USER jenkins
